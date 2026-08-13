@@ -34,8 +34,10 @@ CUTLASS_DEVICE void grid_sync(const layout::Workspace& workspace,
         do {
             new_value = ptx::ld_acq(count_ptr);
             if (clock64() - start_clock >= kNumTimeoutCycles) {
+#ifndef DG_NO_DEVICE_PRINTF
                 printf("DeepGEMM grid sync timeout: sm=%u, thread=%u, grid_sync_idx=%u, old=%u, current=%u, expected_tag=%u\n",
                        sm_idx, thread_idx, kGridSyncIndex, old_value, new_value, old_value ^ kFinishSumTag);
+#endif
                 DG_DEVICE_ASSERT(false and "Grid sync timeout");
             }
         } while (((new_value ^ old_value) & kFinishSumTag) == 0);

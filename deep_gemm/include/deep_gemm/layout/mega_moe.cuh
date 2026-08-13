@@ -24,7 +24,14 @@ CUTLASS_HOST_DEVICE constexpr T get_num_max_pool_tokens(T num_ranks, T num_max_t
         static_cast<T>(kLCMCandidateBlockM));
 }
 
-// SF pool capacity: all experts share a contiguous SF region, sized by pool blocks × SF_BLOCK_M
+// SF pool capacity: all experts share a contiguous SF region, sized by pool blocks x SF_BLOCK_M.
+// Used by the SM90 MegaMoE kernel, whose activation SF buffers span the full pool.
+template <typename T>
+CUTLASS_HOST_DEVICE constexpr T get_num_padded_sf_pool_tokens(T num_max_pool_tokens, T block_m) {
+    return (num_max_pool_tokens / block_m) * math::constexpr_align(block_m, static_cast<T>(128));
+}
+
+// SF ring capacity: paired with the ring buffer, sized by ring blocks x SF_BLOCK_M
 template <typename T>
 CUTLASS_HOST_DEVICE constexpr T get_num_sf_ring_tokens(T num_ring_tokens, T block_m) {
     return (num_ring_tokens / block_m) * math::constexpr_align(block_m, static_cast<T>(128));
@@ -58,6 +65,10 @@ struct Workspace {
     // Full-pool span used by non-ring token metadata
     uint32_t num_max_pool_tokens;
 
+    // Full-pool block count used by the SM90 pool-based L1 -> L2 tracking
+    // (`kMinCandidateBlockM` granularity, mirroring `num_max_pool_tokens`)
+    uint32_t num_max_pool_blocks;
+
     // Keep grid/NVLink/schedule counters separated from expert counters.
     // NVIDIA L2 cache lines are 128B, and these counters are hot atomics.
     static constexpr uint64_t kNumBarrierSignalBytes = 128;
@@ -70,7 +81,10 @@ struct Workspace {
               const uint32_t& num_experts,
               const uint32_t& num_max_tokens_per_rank,
               const uint32_t& num_topk,
-              const uint32_t& num_ring_tokens):
+              // The SM90 kernel tracks L1 -> L2 readiness on the full pool
+              // (`l1_arrival_count` / `l2_arrival_mask`) instead of the ring,
+              // and constructs the workspace without a ring capacity.
+              const uint32_t& num_ring_tokens = 0):
         base(base),
         num_ranks(num_ranks), num_experts(num_experts),
         num_max_tokens_per_rank(num_max_tokens_per_rank),
@@ -78,6 +92,7 @@ struct Workspace {
         num_experts_per_rank = num_experts / num_ranks;
         num_max_recv_tokens_per_expert = num_ranks * num_max_tokens_per_rank;
         num_max_pool_tokens = get_num_max_pool_tokens(num_ranks, num_max_tokens_per_rank, num_topk, num_experts_per_rank);
+        num_max_pool_blocks = num_max_pool_tokens / kMinCandidateBlockM;
         num_ring_blocks = num_ring_tokens / kMinCandidateBlockM;
         num_shared_l2_pool_blocks = math::ceil_div<uint32_t>(num_max_tokens_per_rank, kMinCandidateBlockM);
     }
@@ -115,6 +130,16 @@ struct Workspace {
 
         // Combine push source indices (full)
         num_bytes += num_max_pool_tokens * sizeof(TokenSrcMetadata);
+
+        // SM90 pool-based L1 -> L2 dependency tracking, appended after all of
+        // the above so every SM100 field offset is unchanged. The SM90 kernel
+        // has no ring: L1 completion is counted per full-pool block
+        // (`l1_arrival_count`) and L2 readiness is a per-block bitmask with one
+        // bit per L1-output N block (`l2_arrival_mask`, `uint64`, 8-byte
+        // aligned first).
+        num_bytes = math::align<uint64_t>(num_bytes, 8);
+        num_bytes += num_max_pool_blocks * sizeof(uint64_t);
+        num_bytes += num_max_pool_blocks * sizeof(uint32_t);
 
         // Align to TMA descriptor requirements
         num_bytes = math::align<uint64_t>(num_bytes, 16);
@@ -236,6 +261,23 @@ struct Workspace {
     TokenSrcMetadata* get_token_src_metadata_ptr(const uint32_t& pool_token_idx = 0) const {
         const auto base = reinterpret_cast<TokenSrcMetadata*>(get_src_token_topk_idx_ptr(num_experts_per_rank));
         return base + pool_token_idx;
+    }
+
+    // ---- SM90-only: pool-based L1 -> L2 dependency tracking ----
+    // The SM90 MegaMoE kernel predates the ring-buffer protocol and tracks
+    // dependencies on the full pool: `l1_arrival_count[pool_block]` counts
+    // dispatched tokens per block, `l2_arrival_mask[pool_block]` sets one bit
+    // per completed L1-output N block. Both live past the SM100 fields (see
+    // `get_num_bytes`) so all SM100 offsets stay untouched.
+    CUTLASS_DEVICE
+    uint64_t* get_l2_arrival_mask_ptr(const uint32_t& pool_block_idx = 0) const {
+        const auto end = reinterpret_cast<uint64_t>(get_token_src_metadata_ptr(num_max_pool_tokens));
+        return reinterpret_cast<uint64_t*>(math::align<uint64_t>(end, 8)) + pool_block_idx;
+    }
+
+    CUTLASS_DEVICE
+    uint32_t* get_l1_arrival_count_ptr(const uint32_t& pool_block_idx = 0) const {
+        return reinterpret_cast<uint32_t*>(get_l2_arrival_mask_ptr(num_max_pool_blocks)) + pool_block_idx;
     }
 };
 

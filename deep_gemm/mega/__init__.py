@@ -32,13 +32,23 @@ class SymmBuffer:
         self.intermediate_hidden = intermediate_hidden
 
         # Allocate a symmetric buffer
-        num_bytes, slice_input_buffers = _C.get_symm_buffer_size_for_mega_moe(
-            group.size(), num_experts,
-            num_max_tokens_per_rank, num_topk,
-            hidden, intermediate_hidden,
-            mma_type, activation,
-            num_shared_experts
-        )
+        if mma_type == 'fp8xfp8':
+            # SM90 (Hopper) FP8 MegaMoE: per-128-K float SF, full-pool buffers,
+            # no shared experts (see `get_symm_buffer_size_for_sm90_fp8_mega_moe`)
+            assert num_shared_experts == 0, 'SM90 MegaMoE does not support shared experts yet'
+            num_bytes, slice_input_buffers = _C.get_symm_buffer_size_for_sm90_fp8_mega_moe(
+                group.size(), num_experts,
+                num_max_tokens_per_rank, num_topk,
+                hidden, intermediate_hidden
+            )
+        else:
+            num_bytes, slice_input_buffers = _C.get_symm_buffer_size_for_mega_moe(
+                group.size(), num_experts,
+                num_max_tokens_per_rank, num_topk,
+                hidden, intermediate_hidden,
+                mma_type, activation,
+                num_shared_experts
+            )
         allocator = torch if group.size() == 1 else symm_mem
         self.buffer = allocator.empty(num_bytes, dtype=torch.int8, device='cuda')
         self.handle = (
@@ -72,8 +82,12 @@ def get_symm_buffer_for_mega_moe(group: dist.ProcessGroup,
                                  hidden: int, intermediate_hidden: int,
                                  num_shared_experts: int = 0,
                                  use_fp8_dispatch: Union[bool, None] = None,
-                                 mma_type: str = 'fp8xfp4',
+                                 mma_type: Union[str, None] = None,
                                  activation: str = 'swiglu') -> SymmBuffer:
+    # Arch-dependent default MMA type: FP8xFP8 on SM90 (Hopper), FP8xFP4 on SM100
+    if mma_type is None:
+        mma_type = 'fp8xfp8' if torch.cuda.get_device_capability()[0] == 9 else 'fp8xfp4'
+
     # Align token count
     num_max_tokens_per_rank = align(num_max_tokens_per_rank, _C.get_token_alignment_for_mega_moe())
 
@@ -198,6 +212,54 @@ def bf16_mega_moe(y: torch.Tensor,
         sym_buffer.num_max_tokens_per_rank,
         sym_buffer.num_experts,
         sym_buffer.num_topk,
+        activation, activation_clamp,
+        fast_math
+    )
+
+
+def transform_weights_for_mega_moe_sm90(
+    l1_weights: Tuple[torch.Tensor, torch.Tensor],
+    l2_weights: Tuple[torch.Tensor, torch.Tensor]
+) -> Tuple[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]:
+    """SM90 (Hopper) variant of `transform_weights_for_mega_moe`.
+
+    SM90 has no TMEM / UTCCP path, so the SF tensors are consumed directly by
+    WGMMA promote and don't need the 4x32 transpose. With block (128, 128)
+    weight quantization, weight SFs are read by the math warpgroup directly
+    from global memory in their natural ``(E, N/128, K/128)`` MN-major layout
+    and require no transformation. Only L1's gate/up FP8 weight interleave is
+    preserved (granularity 8, matching the WGMMA accumulator group width).
+    """
+    l1_fp8, l1_sf = l1_weights
+    return (_interleave_weights(l1_fp8), l1_sf), l2_weights
+
+
+def fp8_mega_moe(y: torch.Tensor,
+                 l1_weights: Tuple[torch.Tensor, torch.Tensor],
+                 l2_weights: Tuple[torch.Tensor, torch.Tensor],
+                 sym_buffer: SymmBuffer,
+                 cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
+                 recipe: Tuple[int, int, int] = (128, 128, 128),
+                 activation: str = 'swiglu',
+                 activation_clamp: Optional[float] = None,
+                 fast_math: bool = True):
+    """SM90 (Hopper) MegaMoE entry point.
+
+    Expects FP8 e4m3 weights and block-(128, 128) float scale factors. Backed by
+    the single N-split kernel (BLOCK_M=64, BLOCK_N=256): two math warpgroups
+    split each tile into two 128-wide halves, share one A-tile load, and
+    quantize the L2-input activations at per-128 K (matches the standard DeepEP
+    runner). No shared-expert support yet.
+    """
+    _C.fp8_mega_moe(
+        y,
+        l1_weights, l2_weights,
+        cumulative_local_expert_recv_stats,
+        sym_buffer.buffer,
+        sym_buffer.handle.buffer_ptrs, sym_buffer.group.rank(),
+        sym_buffer.num_max_tokens_per_rank,
+        sym_buffer.num_experts, sym_buffer.num_topk,
+        recipe,
         activation, activation_clamp,
         fast_math
     )

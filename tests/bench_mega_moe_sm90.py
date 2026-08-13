@@ -829,6 +829,7 @@ def _run_one_config(args, num_tokens, num_max_tokens_per_rank,
         baseline_version = baseline_ctx.get('version', 'v2')
         bl_warmup = baseline_ctx.get('warmup', 5)
         bl_repeat = baseline_ctx.get('repeat', 1)
+        check_output = baseline_ctx.get('check', False)
 
         alignment = deep_gemm.get_theoretical_mk_alignment_for_contiguous_layout()
         deep_gemm.set_mk_alignment_for_contiguous_layout(alignment)
@@ -911,6 +912,23 @@ def _run_one_config(args, num_tokens, num_max_tokens_per_rank,
                     l1_w_fp8, l1_w_sf, l2_w_fp8, l2_w_sf,
                     num_experts, hidden, intermediate_hidden,
                     clamp, fast_math, alignment)
+                if check_output and weighted:
+                    # Cross-check the fused kernel against this GPU baseline. The
+                    # PyTorch reference in the correctness test materializes
+                    # dequantized weights per chunk, which is infeasible at large
+                    # token counts; this baseline runs the same math on-device.
+                    y_ref = run_v1c()
+                    y_fused = run_sm90()
+                    torch.cuda.synchronize()
+                    diff = calc_diff(y_fused, y_ref)
+                    ok = diff < 0.01
+                    dist_print(
+                        f'   -> check[vs v1-contig] diff={diff:.6f} '
+                        f'{"PASS" if ok else "FAIL"}  (rank{rank_idx})',
+                        once_in_node=True)
+                    if not ok:
+                        raise AssertionError(
+                            f'fused vs v1-contig diff={diff:.6f} exceeds 0.01')
                 t = tilelang_bench(
                     run_v1c, _n_warmup=bl_warmup, _n_repeat=bl_repeat,
                     backend='event', return_mode='median') / 1e3
@@ -1019,7 +1037,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             enabled=is_legacy_loaded,
             deep_ep=deep_ep, tilelang_ops=tilelang_ops, do_bench=do_bench,
             version=args.baseline_version,
-            warmup=args.baseline_warmup, repeat=args.baseline_repeat)
+            warmup=args.baseline_warmup, repeat=args.baseline_repeat,
+            check=args.check)
 
     dist_print(
         f'SM90 MegaMoE bench: ranks={num_ranks} hidden={args.hidden} '
@@ -1087,6 +1106,11 @@ if __name__ == '__main__':
                         help="DeepEP baseline API: 'v2' = ElasticBuffer (default), "
                              "'v1' = classic Buffer dispatch/combine, "
                              "'both' = run V1 and V2 and report each")
+    parser.add_argument('--check', action='store_true',
+                        help='Cross-check fused output against the v1-contig GPU '
+                             'baseline (needs --baseline --baseline-version v1). '
+                             'Use at large token counts where the PyTorch '
+                             'reference in the correctness test is infeasible')
     parser.add_argument('--baseline-warmup', type=int, default=5,
                         help='Warmup iters for the baseline timing (do_bench _n_warmup)')
     parser.add_argument('--baseline-repeat', type=int, default=1,

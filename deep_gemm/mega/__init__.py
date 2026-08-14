@@ -33,13 +33,14 @@ class SymmBuffer:
 
         # Allocate a symmetric buffer
         if mma_type == 'fp8xfp8':
-            # SM90 (Hopper) FP8 MegaMoE: per-128-K float SF, full-pool buffers,
-            # no shared experts (see `get_symm_buffer_size_for_sm90_fp8_mega_moe`)
-            assert num_shared_experts == 0, 'SM90 MegaMoE does not support shared experts yet'
+            # SM90 (Hopper) FP8 MegaMoE: per-128-K float SF, full-pool buffers.
+            # Shared experts: L1 acts alias x/x_sf; only shared L2 acts + SF are
+            # real buffers (see `get_symm_buffer_size_for_sm90_fp8_mega_moe`).
             num_bytes, slice_input_buffers = _C.get_symm_buffer_size_for_sm90_fp8_mega_moe(
                 group.size(), num_experts,
                 num_max_tokens_per_rank, num_topk,
-                hidden, intermediate_hidden
+                hidden, intermediate_hidden,
+                num_shared_experts
             )
         else:
             num_bytes, slice_input_buffers = _C.get_symm_buffer_size_for_mega_moe(
@@ -219,8 +220,10 @@ def bf16_mega_moe(y: torch.Tensor,
 
 def transform_weights_for_mega_moe_sm90(
     l1_weights: Tuple[torch.Tensor, torch.Tensor],
-    l2_weights: Tuple[torch.Tensor, torch.Tensor]
-) -> Tuple[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]:
+    l2_weights: Tuple[torch.Tensor, torch.Tensor],
+    shared_l1_weights: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    shared_l2_weights: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+):
     """SM90 (Hopper) variant of `transform_weights_for_mega_moe`.
 
     SM90 has no TMEM / UTCCP path, so the SF tensors are consumed directly by
@@ -229,15 +232,23 @@ def transform_weights_for_mega_moe_sm90(
     from global memory in their natural ``(E, N/128, K/128)`` MN-major layout
     and require no transformation. Only L1's gate/up FP8 weight interleave is
     preserved (granularity 8, matching the WGMMA accumulator group width).
+    Shared L1 weights (2D) get the same gate/up interleave; shared L2 and all
+    SFs pass through unchanged.
     """
     l1_fp8, l1_sf = l1_weights
-    return (_interleave_weights(l1_fp8), l1_sf), l2_weights
+    if shared_l1_weights is None:
+        return (_interleave_weights(l1_fp8), l1_sf), l2_weights
+    s1_fp8, s1_sf = shared_l1_weights
+    return ((_interleave_weights(l1_fp8), l1_sf), l2_weights,
+            (_interleave_weights(s1_fp8), s1_sf), shared_l2_weights)
 
 
 def fp8_mega_moe(y: torch.Tensor,
                  l1_weights: Tuple[torch.Tensor, torch.Tensor],
                  l2_weights: Tuple[torch.Tensor, torch.Tensor],
                  sym_buffer: SymmBuffer,
+                 shared_l1_weights: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+                 shared_l2_weights: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
                  cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
                  recipe: Tuple[int, int, int] = (128, 128, 128),
                  activation: str = 'swiglu',
@@ -249,11 +260,13 @@ def fp8_mega_moe(y: torch.Tensor,
     the single N-split kernel (BLOCK_M=64, BLOCK_N=256): two math warpgroups
     split each tile into two 128-wide halves, share one A-tile load, and
     quantize the L2-input activations at per-128 K (matches the standard DeepEP
-    runner). No shared-expert support yet.
+    runner). Shared experts (optional, 2D FP8 weight pairs) run as fused dense
+    phases; their output enters combine with weight 1.0.
     """
     _C.fp8_mega_moe(
         y,
         l1_weights, l2_weights,
+        shared_l1_weights, shared_l2_weights,
         cumulative_local_expert_recv_stats,
         sym_buffer.buffer,
         sym_buffer.handle.buffer_ptrs, sym_buffer.group.rank(),

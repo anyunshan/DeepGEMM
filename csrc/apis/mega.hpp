@@ -659,26 +659,30 @@ static void fp8_mega_moe(
     DG_HOST_ASSERT(sym_buffer.nbytes() >= static_cast<size_t>(num_required_bytes));
     DG_HOST_ASSERT(num_experts == num_experts_);
 
-    // Already registered tensors (shared L1 acts alias x/x_sf).
-    // NOTE: shared_l2_acts / shared_l2_acts_sf and the shared weight tensors are
-    // validated and sized here but not yet forwarded to the kernel launcher —
-    // the kernel-side shared phases land in a follow-up commit. Until then a
-    // non-empty shared weight pair is rejected to avoid silently ignoring it.
-    DG_HOST_ASSERT(num_shared_experts == 0 and "SM90 shared-expert kernel phases not wired up yet");
+    // Already registered tensors (shared L1 acts alias x/x_sf)
     const auto [x, x_sf, topk_idx, topk_weights,
                 _shared_l1_acts, _shared_l1_acts_sf, shared_l2_acts, shared_l2_acts_sf,
                 l1_acts, l1_acts_sf, l2_acts, l2_acts_sf] = slice(sym_buffer);
 
-    // Single N-split kernel (BLOCK_M=64, BLOCK_N=256) for all token counts
+    // Single N-split kernel (BLOCK_M=64, BLOCK_N=256) for all token counts.
+    // NOTE: the kernel's shared phases are not implemented yet (B1.3/B1.4);
+    // launching with num_shared_experts > 0 would silently skip the shared FFN,
+    // so it stays rejected here until the phases land.
+    DG_HOST_ASSERT(num_shared_experts == 0 and "SM90 shared-expert kernel phases not wired up yet");
     sm90_fp8_mega_moe(y,
+                     x,
                      l1_acts, l1_acts_sf,
                      l2_acts, l2_acts_sf,
                      l1_weights, l2_weights,
                      l1_weights_sf, l2_weights_sf,
+                     shared_l2_acts, shared_l2_acts_sf,
+                     shared_l1_weights, shared_l2_weights,
+                     shared_l1_weights_sf, shared_l2_weights_sf,
                      cumulative_local_expert_recv_stats,
                      sym_buffer_ptrs,
                      rank_idx, num_max_tokens_per_rank,
                      num_experts_per_rank,
+                     num_shared_experts,
                      num_tokens, num_topk,
                      hidden, intermediate_hidden,
                      activation_clamp, fast_math);

@@ -35,6 +35,7 @@ template <
     uint32_t kNumMaxTokensPerRank,
     uint32_t kHidden, uint32_t kIntermediateHidden,
     uint32_t kNumExperts, uint32_t kNumTopk,
+    uint32_t kNumSharedExperts,
     uint32_t kNumExpertsPerWave,
     uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
     uint32_t kNumMaxPoolTokens,
@@ -51,6 +52,9 @@ template <
     uint32_t L1_SHAPE_K              = kHidden,
     uint32_t L2_SHAPE_N              = kHidden,
     uint32_t L2_SHAPE_K              = kIntermediateHidden,
+    bool kHasShared                  = kNumSharedExperts > 0,
+    uint32_t SHARED_L1_SHAPE_N       = L1_SHAPE_N * kNumSharedExperts,
+    uint32_t SHARED_L2_SHAPE_K       = L2_SHAPE_K * kNumSharedExperts,
     uint32_t kNumDispatchWarps       = kNumDispatchThreads / 32,
     uint32_t kNumMMANonEpilogueWarps = kNumNonEpilogueThreads / 32,
     uint32_t kNumEpilogueWarps       = kNumEpilogueThreads / 32,
@@ -71,7 +75,18 @@ sm90_fp8_mega_moe_impl(void* y,
                        const __grid_constant__ cute::TmaDescriptor tensor_map_l2_acts,
                        const __grid_constant__ cute::TmaDescriptor tensor_map_l2_acts_sf,
                        const __grid_constant__ cute::TmaDescriptor tensor_map_l2_weights,
-                       const float* __restrict__ l2_weights_sf) {
+                       const float* __restrict__ l2_weights_sf,
+                       // Shared-expert tensormaps: valid routed fallbacks when
+                       // kNumSharedExperts == 0 (all uses are compile-time dead).
+                       // Only the SFs go via raw-pointer ldg (K-major, derived
+                       // from the device-side buffer chain); acts tiles are TMA'd.
+                       const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l1_acts,
+                       const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l1_weights,
+                       const float* __restrict__ shared_l1_weights_sf,
+                       const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l1_output,
+                       const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l2_acts,
+                       const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l2_weights,
+                       const float* __restrict__ shared_l2_weights_sf) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 900) and (__CUDA_ARCH__ < 1000))
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
 
@@ -85,6 +100,9 @@ sm90_fp8_mega_moe_impl(void* y,
     DG_STATIC_ASSERT(BLOCK_M == 64, "BLOCK_M is fixed to 64 (one m64 WGMMA covers all rows)");
     DG_STATIC_ASSERT(BLOCK_N == 256, "BLOCK_N is fixed to 256 (N-split into two 128-col halves)");
     DG_STATIC_ASSERT(BLOCK_K == 128, "BLOCK_K is fixed to 128 (per-128 SF)");
+    // Shared expert constraints (vacuous when kNumSharedExperts == 0)
+    DG_STATIC_ASSERT(SHARED_L1_SHAPE_N % BLOCK_N == 0, "Shared L1 width must tile by BLOCK_N");
+    DG_STATIC_ASSERT(kNumTopk + (kHasShared ? 1u : 0u) <= 32u, "Top-k + shared must fit in a single warp");
 
     // Thread / warp identification
     const uint32_t sm_idx     = blockIdx.x;
@@ -101,6 +119,13 @@ sm90_fp8_mega_moe_impl(void* y,
         cute::prefetch_tma_descriptor(&tensor_map_l2_acts);
         cute::prefetch_tma_descriptor(&tensor_map_l2_acts_sf);
         cute::prefetch_tma_descriptor(&tensor_map_l2_weights);
+        if constexpr (kHasShared) {
+            cute::prefetch_tma_descriptor(&tensor_map_shared_l1_acts);
+            cute::prefetch_tma_descriptor(&tensor_map_shared_l1_weights);
+            cute::prefetch_tma_descriptor(&tensor_map_shared_l1_output);
+            cute::prefetch_tma_descriptor(&tensor_map_shared_l2_acts);
+            cute::prefetch_tma_descriptor(&tensor_map_shared_l2_weights);
+        }
     }
 
     // Workspaces and symmetric buffer slicing (mirror SM100 layout; both L1
@@ -115,6 +140,10 @@ sm90_fp8_mega_moe_impl(void* y,
     constexpr auto fp8_sf_layout = layout::Data(kHidden / 32);
     // NOTES: must match the host buffer allocation in `get_symm_buffer_size_for_mega_moe`
     constexpr auto fp8_intermediate_sf_layout = layout::Data(kIntermediateHidden / 32);
+    // Shared expert: L1 output (= L2 input) tokens + K-major float SF. Zero-length
+    // when kNumSharedExperts == 0 (layout::Data(0) is a valid empty layout).
+    constexpr auto shared_intermediate_token_layout = layout::Data(SHARED_L2_SHAPE_K);
+    constexpr auto shared_intermediate_sf_layout    = layout::Data(SHARED_L2_SHAPE_K / 32, false);
     constexpr auto input_topk_idx_layout      = layout::Data(kNumTopk * sizeof(int64_t), false);
     constexpr auto input_topk_weights_layout  = layout::Data(kNumTopk * sizeof(float), false);
     constexpr auto l1_topk_weights_layout     = layout::Data(sizeof(float), false);
@@ -125,8 +154,17 @@ sm90_fp8_mega_moe_impl(void* y,
     const auto input_topk_idx_buffer     = layout::Buffer(input_topk_idx_layout, 1, kNumMaxTokensPerRank, input_sf_buffer.get_end_ptr());
     const auto input_topk_weights_buffer = layout::Buffer(input_topk_weights_layout, 1, kNumMaxTokensPerRank, input_topk_idx_buffer.get_end_ptr());
 
+    // Shared expert area (must mirror `get_symm_buffer_size_for_sm90_fp8_mega_moe`:
+    // between the input area and the routed pool; zero-length when no shared experts)
+    const auto shared_l2_token_buffer = layout::Buffer(
+        shared_intermediate_token_layout, 1, kHasShared ? kNumMaxTokensPerRank : 0,
+        input_topk_weights_buffer.get_end_ptr());
+    const auto shared_l2_sf_buffer = layout::Buffer(
+        shared_intermediate_sf_layout, 1, kHasShared ? kNumMaxTokensPerRank : 0,
+        shared_l2_token_buffer.get_end_ptr());
+
     // L1 input area
-    const auto l1_token_buffer        = layout::Buffer(fp8_token_layout, 1, kNumMaxPoolTokens, input_topk_weights_buffer.get_end_ptr());
+    const auto l1_token_buffer        = layout::Buffer(fp8_token_layout, 1, kNumMaxPoolTokens, shared_l2_sf_buffer.get_end_ptr());
     const auto l1_sf_buffer           = layout::Buffer(fp8_sf_layout, 1, kNumPaddedSFPoolTokens, l1_token_buffer.get_end_ptr());
     const auto l1_topk_weights_buffer = layout::Buffer(l1_topk_weights_layout, 1, kNumMaxPoolTokens, l1_sf_buffer.get_end_ptr());
 
@@ -134,8 +172,9 @@ sm90_fp8_mega_moe_impl(void* y,
     const auto l2_token_buffer = layout::Buffer(fp8_intermediate_token_layout, 1, kNumMaxPoolTokens, l1_topk_weights_buffer.get_end_ptr());
     const auto l2_sf_buffer    = layout::Buffer(fp8_intermediate_sf_layout, 1, kNumPaddedSFPoolTokens, l2_token_buffer.get_end_ptr());
 
-    // Combine input area
-    const auto combine_token_buffer = layout::Buffer(bf16_token_layout, kNumTopk, kNumMaxTokensPerRank, l2_sf_buffer.get_end_ptr());
+    // Combine input area: one landing slot per topk plus one shared slot
+    constexpr uint32_t kNumCombineSlots = kNumTopk + (kHasShared ? 1u : 0u);
+    const auto combine_token_buffer = layout::Buffer(bf16_token_layout, kNumCombineSlots, kNumMaxTokensPerRank, l2_sf_buffer.get_end_ptr());
 
     // GEMM data types and shape constants
     using a_dtype_t = cutlass::float_e4m3_t;

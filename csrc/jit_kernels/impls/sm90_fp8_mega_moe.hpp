@@ -27,6 +27,7 @@ public:
         int num_max_tokens_per_rank;
         int hidden, intermediate_hidden;
         int num_experts, num_topk;
+        int num_shared_experts;
         int num_ranks;
         float activation_clamp;
         bool fast_math;
@@ -51,16 +52,24 @@ public:
         CUtensorMap tensor_map_l2_weights;
         const float* l2_weights_sf;
 
+        // Shared expert (fallback copies of routed maps when num_shared == 0)
+        CUtensorMap tensor_map_shared_l1_acts;
+        CUtensorMap tensor_map_shared_l1_weights;
+        const float* shared_l1_weights_sf;
+        CUtensorMap tensor_map_shared_l1_output;
+        CUtensorMap tensor_map_shared_l2_acts;
+        CUtensorMap tensor_map_shared_l2_weights;
+        const float* shared_l2_weights_sf;
+
         // Launch configs
         LaunchArgs launch_args;
     };
 
     static std::string generate_impl(const Args& args) {
         return fmt::format(R"(
-// JIT cache key: sm90_mega_moe_v34 (v30: renamed from cooperative_v29, see git log
-// for the numerics history — bit-exact vs sglang DeepEP; v31: chunked dispatch pull;
-// v34: per-stage SMEM SFB slots filled by the B loader (no math-WG global SF reads);
-// the L2 pingpong experiment (v32/v33) is removed).
+// JIT cache key: sm90_mega_moe_v35 (v34: per-stage SMEM SFB slots; v35: shared-expert
+// template params + tensormap args — signature change, no behavior change at ns=0.
+// See git log for the numerics history — bit-exact vs sglang DeepEP).
 // Trap-only asserts / no printf: vprintf causes ptxas C7510 (serialized WGMMA).
 #define DG_DEVICE_ASSERT(cond) do {{ if (not (cond)) asm("trap;"); }} while (0)
 #define DG_NO_DEVICE_PRINTF
@@ -73,6 +82,7 @@ static void __instantiate_kernel() {{
         {},
         {}, {},
         {}, {},
+        {},
         {},
         {}, {}, {},
         {},
@@ -89,6 +99,7 @@ static void __instantiate_kernel() {{
     args.num_max_tokens_per_rank,
     args.hidden, args.intermediate_hidden,
     args.num_experts, args.num_topk,
+    args.num_shared_experts,
     args.config.num_experts_per_wave,
     args.config.block_m, args.config.block_n, args.config.block_k,
     args.config.num_max_pool_tokens,
@@ -116,21 +127,33 @@ static void __instantiate_kernel() {{
             args.tensor_map_l2_acts,
             args.tensor_map_l2_acts_sf,
             args.tensor_map_l2_weights,
-            args.l2_weights_sf
+            args.l2_weights_sf,
+            args.tensor_map_shared_l1_acts,
+            args.tensor_map_shared_l1_weights,
+            args.shared_l1_weights_sf,
+            args.tensor_map_shared_l1_output,
+            args.tensor_map_shared_l2_acts,
+            args.tensor_map_shared_l2_weights,
+            args.shared_l2_weights_sf
         ));
     }
 };
 
 static void sm90_fp8_mega_moe(
     const torch::Tensor& y,
+    const torch::Tensor& x,
     const torch::Tensor& l1_acts, const torch::Tensor& l1_acts_sf,
     const torch::Tensor& l2_acts, const torch::Tensor& l2_acts_sf,
     const torch::Tensor& l1_weights, const torch::Tensor& l2_weights,
     const torch::Tensor& l1_weights_sf, const torch::Tensor& l2_weights_sf,
+    const torch::Tensor& shared_l2_acts, const torch::Tensor& shared_l2_acts_sf,
+    const torch::Tensor& shared_l1_weights, const torch::Tensor& shared_l2_weights,
+    const torch::Tensor& shared_l1_weights_sf, const torch::Tensor& shared_l2_weights_sf,
     const std::optional<torch::Tensor> cumulative_local_expert_recv_stats,
     const std::vector<int64_t>& sym_buffer_ptrs,
     const int& rank_idx, const int& num_max_tokens_per_rank,
     const int& num_experts_per_rank,
+    const int& num_shared_experts,
     const int& num_tokens, const int& num_topk,
     const int& hidden, const int& intermediate_hidden,
     const float& activation_clamp,
@@ -139,6 +162,7 @@ static void sm90_fp8_mega_moe(
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts = num_experts_per_rank * num_ranks;
     const auto num_padded_sf_pool_tokens = static_cast<int>(l1_acts_sf.size(0));
+    const auto shared_intermediate_hidden = intermediate_hidden * num_shared_experts;
 
     // Heuristics
     const auto config = get_mega_moe_config_sm90(
@@ -190,6 +214,41 @@ static void sm90_fp8_mega_moe(
                                                         static_cast<int>(l2_weights.stride(-2)),
                                                         config.swizzle_weights_mode);
 
+    // Shared expert descriptors. When num_shared_experts == 0 every kernel use is
+    // compile-time dead; pass valid routed fallbacks so the __grid_constant__
+    // params still carry well-formed tensormaps (SM100 convention).
+    const bool with_shared = num_shared_experts > 0;
+    const auto tensor_map_shared_l1_acts = with_shared ? make_tma_2d_desc(
+        x,
+        hidden, num_max_tokens_per_rank,
+        config.block_k, config.block_m,
+        static_cast<int>(x.stride(-2)),
+        config.swizzle_acts_mode) : tensor_map_l1_acts;
+    const auto tensor_map_shared_l1_weights = with_shared ? make_tma_2d_desc(
+        shared_l1_weights,
+        hidden, shared_intermediate_hidden * 2,
+        config.block_k, config.block_n,
+        static_cast<int>(shared_l1_weights.stride(-2)),
+        config.swizzle_weights_mode) : tensor_map_l1_weights;
+    const auto tensor_map_shared_l1_output = with_shared ? make_tma_2d_desc(
+        shared_l2_acts,
+        shared_intermediate_hidden, num_max_tokens_per_rank,
+        config.block_n / 2, config.block_m,
+        static_cast<int>(shared_l2_acts.stride(-2)),
+        0) : tensor_map_l1_output;
+    const auto tensor_map_shared_l2_acts = with_shared ? make_tma_2d_desc(
+        shared_l2_acts,
+        shared_intermediate_hidden, num_max_tokens_per_rank,
+        config.block_k, config.block_m,
+        static_cast<int>(shared_l2_acts.stride(-2)),
+        config.swizzle_acts_mode) : tensor_map_l2_acts;
+    const auto tensor_map_shared_l2_weights = with_shared ? make_tma_2d_desc(
+        shared_l2_weights,
+        shared_intermediate_hidden, hidden,
+        config.block_k, config.block_n,
+        static_cast<int>(shared_l2_weights.stride(-2)),
+        config.swizzle_weights_mode) : tensor_map_l2_weights;
+
     // Stats can be optional
     int* cumulative_local_expert_recv_stats_ptr = nullptr;
     if (cumulative_local_expert_recv_stats.has_value())
@@ -201,6 +260,7 @@ static void sm90_fp8_mega_moe(
         .num_max_tokens_per_rank = num_max_tokens_per_rank,
         .hidden = hidden, .intermediate_hidden = intermediate_hidden,
         .num_experts = num_experts, .num_topk = num_topk,
+        .num_shared_experts = num_shared_experts,
         .num_ranks = num_ranks,
         .activation_clamp = activation_clamp,
         .fast_math = fast_math,
@@ -218,6 +278,13 @@ static void sm90_fp8_mega_moe(
         .tensor_map_l2_acts_sf = tensor_map_l2_acts_sf,
         .tensor_map_l2_weights = tensor_map_l2_weights,
         .l2_weights_sf = l2_weights_sf.data_ptr<float>(),
+        .tensor_map_shared_l1_acts = tensor_map_shared_l1_acts,
+        .tensor_map_shared_l1_weights = tensor_map_shared_l1_weights,
+        .shared_l1_weights_sf = with_shared ? shared_l1_weights_sf.data_ptr<float>() : l1_weights_sf.data_ptr<float>(),
+        .tensor_map_shared_l1_output = tensor_map_shared_l1_output,
+        .tensor_map_shared_l2_acts = tensor_map_shared_l2_acts,
+        .tensor_map_shared_l2_weights = tensor_map_shared_l2_weights,
+        .shared_l2_weights_sf = with_shared ? shared_l2_weights_sf.data_ptr<float>() : l2_weights_sf.data_ptr<float>(),
         .launch_args = LaunchArgs(num_sms, config.num_dispatch_threads + config.num_non_epilogue_threads + config.num_epilogue_threads,
                                   config.smem_size, config.cluster_size)
     };

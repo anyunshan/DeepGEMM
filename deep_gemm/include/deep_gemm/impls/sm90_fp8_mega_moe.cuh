@@ -55,6 +55,14 @@ template <
     bool kHasShared                  = kNumSharedExperts > 0,
     uint32_t SHARED_L1_SHAPE_N       = L1_SHAPE_N * kNumSharedExperts,
     uint32_t SHARED_L2_SHAPE_K       = L2_SHAPE_K * kNumSharedExperts,
+    // Shared-expert task-space bounds (worst case: num_tokens == kNumMaxTokensPerRank).
+    // SharedLinear1: one task per (m_block, n_block) of the fused shared L1 GEMM;
+    // SharedLinear2: one task per (m_block, n_block) of the shared L2 GEMM.
+    // Runtime counts (from num_tokens) are derived in-kernel; skeleton loops use
+    // these static bounds and the phase split below.
+    uint32_t kNumSharedL1Tasks       = kHasShared ? math::constexpr_ceil_div(kNumMaxTokensPerRank, BLOCK_M) * (SHARED_L1_SHAPE_N / BLOCK_N) : 0,
+    uint32_t kNumSharedL2Tasks       = kHasShared ? math::constexpr_ceil_div(kNumMaxTokensPerRank, BLOCK_M) * (L2_SHAPE_N / BLOCK_N) : 0,
+    uint32_t kNumSharedTasks         = kNumSharedL1Tasks + kNumSharedL2Tasks,
     uint32_t kNumDispatchWarps       = kNumDispatchThreads / 32,
     uint32_t kNumMMANonEpilogueWarps = kNumNonEpilogueThreads / 32,
     uint32_t kNumEpilogueWarps       = kNumEpilogueThreads / 32,
@@ -661,6 +669,17 @@ sm90_fp8_mega_moe_impl(void* y,
 
         // NOTES: manually inlined scheduler loop, avoids lambda outlining that
         // causes C7510 WGMMA serialization in the math warpgroup path
+        // SharedLinear1 loads: x / shared L1 weights are valid at kernel entry, so
+        // these tiles feed the pipeline while dispatch is still publishing counts
+        // (design doc D2 — loaders do not join the 320-thread rendezvous)
+        if constexpr (kHasShared) {
+            for (uint32_t task = sm_idx; task < kNumSharedL1Tasks; task += kNumSMs) {
+                // TODO B1.4: TMA-load shared L1 A/B tiles + stage SFs through the
+                // regular full/empty stage protocol (expect_tx WITHOUT the +BLOCK_M*4
+                // SF bytes: shared A-SF goes via st_shared, not TMA — design doc D3)
+            }
+        }
+
         scheduler.fetch_expert_recv_count();
         scheduler.set_expert_idx(0);
         while (true) {
@@ -716,6 +735,14 @@ sm90_fp8_mega_moe_impl(void* y,
                         SMEM_A_SIZE_PER_STAGE + BLOCK_M * sizeof(float));
                 }
                 __syncwarp();
+            }
+        }
+
+        // SharedLinear2 loads (B1.4): after the routed stream ends, feed shared L2
+        // tiles gated on shared_l2_full_count[m_block] == SHARED_L1_SHAPE_N/BLOCK_N
+        if constexpr (kHasShared) {
+            for (uint32_t task = sm_idx; task < kNumSharedL2Tasks; task += kNumSMs) {
+                // TODO B1.4: wait shared_l2_full_count, then TMA-load shared L2 A/B
             }
         }
 
@@ -807,6 +834,16 @@ sm90_fp8_mega_moe_impl(void* y,
 
         // Sync with dispatch
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
+
+        // SharedLinear1 compute: AFTER the rendezvous above (so dispatch is never
+        // blocked behind shared work) and BEFORE the fetch spin — this fills the
+        // dispatch pull window with shared L1 WGMMA (design doc D2)
+        if constexpr (kHasShared) {
+            for (uint32_t task = sm_idx; task < kNumSharedL1Tasks; task += kNumSMs) {
+                // TODO B1.4: consume staged tiles, WGMMA, SwiGLU epilogue, FP8 quant,
+                // store to shared_l2_token_buffer/-_sf, red_add_rel shared_l2_full_count
+            }
+        }
 
         // NOTES: manually inlined scheduler loop, avoids lambda outlining that
         // causes ptxas C7510 (serialized WGMMA pipeline)
@@ -1205,6 +1242,15 @@ sm90_fp8_mega_moe_impl(void* y,
                 ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
             }
             ++pos;
+        }
+
+        // SharedLinear2 compute: after every routed block is done (design doc D2);
+        // output goes to combine slot kNumTopk with weight 1.0, local rank only
+        if constexpr (kHasShared) {
+            for (uint32_t task = sm_idx; task < kNumSharedL2Tasks; task += kNumSMs) {
+                // TODO B1.4: consume staged shared L2 tiles, WGMMA, BF16 epilogue,
+                // local store to combine_token_buffer.get_rank_buffer(kNumTopk)
+            }
         }
 
         // Flush any still-pending L1 store (e.g. a wave ending on L1 blocks)

@@ -13,7 +13,9 @@ namespace deep_gemm::sched {
 enum class BlockPhase {
     None = 0,
     Linear1 = 1,
-    Linear2 = 2
+    Linear2 = 2,
+    SharedLinear1 = 3,
+    SharedLinear2 = 4
 };
 
 template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,

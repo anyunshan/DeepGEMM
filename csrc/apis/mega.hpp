@@ -665,10 +665,6 @@ static void fp8_mega_moe(
                 l1_acts, l1_acts_sf, l2_acts, l2_acts_sf] = slice(sym_buffer);
 
     // Single N-split kernel (BLOCK_M=64, BLOCK_N=256) for all token counts.
-    // NOTE: the kernel's shared phases are not implemented yet (B1.3/B1.4);
-    // launching with num_shared_experts > 0 would silently skip the shared FFN,
-    // so it stays rejected here until the phases land.
-    DG_HOST_ASSERT(num_shared_experts == 0 and "SM90 shared-expert kernel phases not wired up yet");
     sm90_fp8_mega_moe(y,
                      x,
                      l1_acts, l1_acts_sf,

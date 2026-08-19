@@ -52,7 +52,7 @@ template <
     uint32_t L1_SHAPE_K              = kHidden,
     uint32_t L2_SHAPE_N              = kHidden,
     uint32_t L2_SHAPE_K              = kIntermediateHidden,
-    bool kHasShared                  = kNumSharedExperts > 0,
+    bool kHasShared                  = (kNumSharedExperts > 0),
     uint32_t SHARED_L1_SHAPE_N       = L1_SHAPE_N * kNumSharedExperts,
     uint32_t SHARED_L2_SHAPE_K       = L2_SHAPE_K * kNumSharedExperts,
     // Shared-expert task-space bounds (worst case: num_tokens == kNumMaxTokensPerRank).

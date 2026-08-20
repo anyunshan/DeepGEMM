@@ -10,17 +10,39 @@ alternative you would otherwise pay:
                        so the comparison is kernel-vs-kernel and does not
                        flatter the fused path)
 
-Known bias in (3): the two GEMMs are DeepGEMM kernels, but the SwiGLU +
-requantize step between them is eager PyTorch, which is slower than a fused
-op would be. That inflates the serial baseline and therefore *understates*
-the ratio — the real figure is worse than what this prints. Replace that
-middle step (Triton, or the tilelang op the SM100 baseline uses) before
-treating the ratio as a reportable number.
+Baseline (3) is kernel-only end to end: two DeepGEMM dense GEMMs with a fused
+Triton SwiGLU/quant between them, so it is not inflated by eager elementwise
+work. It is still dominated by per-launch overhead, though — see the bandwidth
+note below.
 
 Design goal (doc D2): shared L1 is issued after the 320-thread rendezvous but
 before the dispatch-count spin, so its WGMMA overlaps the dispatch pull. If
 that overlap works, `fused - routed` should land well under the standalone
 shared FFN time.
+
+Measured (8 ranks, 20 tests, GLM-5.2 shape, 256 experts):
+
+  t128     routed   360.6us  fused   401.3us  delta   40.7us  serial  116.0us   35.1%
+  t2048    routed  1909.3us  fused  2139.7us  delta  230.4us  serial  132.7us  173.6%
+  t16384   routed 14147.3us  fused 15679.4us  delta 1532.1us  serial  917.2us  167.0%
+
+DO NOT read the ratio column as fusion efficiency yet — the denominator is not
+trustworthy. The standalone baseline achieves only 0.35-0.63 TB/s effective
+bandwidth on a machine with ~4.8 TB/s of HBM3e. Its 37.7MB of FP8 shared weights
+have a pure-read floor near 7.9us, yet t128 measures 116us: roughly 14x the
+floor. Most of that is launch gap and sync between three separate kernels, not
+compute or data movement, so the ratio mainly tracks how far that fixed overhead
+is amortised by batch size rather than how well fusion overlaps.
+
+What the data does support: the fused delta grows markedly SUB-linearly in
+tokens — 16x more tokens for 5.7x the delta, 128x for 37.6x — so the overlap
+mechanism is working, and working better at larger batches, not worse. The
+absolute kernel times (routed and fused columns) are plain CUDA-event
+measurements over 20 iterations and are sound; it is only the comparison against
+this baseline that is not yet meaningful.
+
+Fixing the baseline (e.g. capturing the three kernels in one CUDA graph to
+eliminate launch gaps) is a prerequisite for quoting any efficiency figure.
 """
 
 import argparse
@@ -47,10 +69,18 @@ from test_mega_moe_sm90 import (
     _stable_name_seed,
 )
 from test_shared_expert_sm90 import _quantize_2d_fp8_block_128_128
+# Fused SwiGLU + per-128-K FP8 quant (pure Triton; the tilelang op the SM100
+# baseline uses is unavailable here). Reused so the serial baseline is built
+# from real kernels end to end rather than eager ops.
+from bench_mega_moe_sm90 import swiglu_apply_weight_to_fp8_triton
 
 
 # SM90 activation SF is per-token / per-128-K, weight SF is block (128, 128).
 _DENSE_RECIPE = (1, 128, 128)
+
+# GLM-5.2 has 256 routed experts. Pinned (not scaled by rank count) so figures
+# from different rank counts stay comparable; see `_scenarios`.
+_GLM_NUM_EXPERTS = 256
 
 
 def _make_inputs(cfg: Dict[str, Any], rank_idx: int, num_ranks: int):
@@ -148,13 +178,17 @@ def _make_runner(cfg, inp, group, num_shared: int):
 def _make_shared_ffn_runner(cfg, inp):
     """Standalone shared FFN via DeepGEMM dense GEMMs (the serial alternative).
 
-    x -> fp8_gemm_nt(s1) -> SwiGLU -> requant per-128-K -> fp8_gemm_nt(s2)
+    x -> fp8_gemm_nt(s1) -> [Triton SwiGLU + per-128-K FP8 quant] -> fp8_gemm_nt(s2)
 
-    The SwiGLU + requant step is plain PyTorch here. On SM100 the equivalent
-    baseline uses a tilelang op; SM90 has no such dependency in this repo, so
-    the two GEMMs (the part that dominates) are DeepGEMM kernels and only the
-    elementwise middle is eager. That makes this baseline slightly pessimistic
-    on the elementwise portion — noted where results are reported.
+    Every step is a real kernel: two DeepGEMM dense GEMMs with a fused Triton
+    SwiGLU/quant in between (the same op `bench_mega_moe_sm90.py` uses for its
+    unfused baseline). An eager PyTorch middle would cost ~4 extra HBM round
+    trips and inflate this baseline, understating the fusion ratio.
+
+    Note the Triton op keeps SwiGLU in fp32 throughout, whereas the kernel's
+    epilogue rounds to bf16 on both the GEMM output and the SwiGLU result. That
+    makes the two differ by ~6e-5 in value — irrelevant for timing, and
+    correctness is owned by `_shared_reference` in the test suite, not here.
     """
     hidden = cfg['hidden']
     clamp = cfg.get('activation_clamp', 10.0)
@@ -167,17 +201,14 @@ def _make_shared_ffn_runner(cfg, inp):
     l1_out = torch.empty((num_tokens, shared_ih * 2), dtype=torch.bfloat16, device='cuda')
     y = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
 
+    clamp_arg = clamp if math.isfinite(clamp) else None
+
     def run():
         deep_gemm.fp8_gemm_nt(x_pair, s1_pair, l1_out, recipe=_DENSE_RECIPE,
                               disable_ue8m0_cast=True)
-        gate, up = l1_out.chunk(2, dim=-1)
-        if math.isfinite(clamp):
-            gate = gate.clamp(max=clamp)
-            up = up.clamp(min=-clamp, max=clamp)
-        act = torch.nn.functional.silu(gate.float()) * up.float()
-        act_fp8, act_sf = per_token_cast_to_fp8(
-            act.to(torch.bfloat16), use_ue8m0=False, gran_k=128,
-            use_packed_ue8m0=False)
+        act_fp8, act_sf = swiglu_apply_weight_to_fp8_triton(
+            l1_out, topk_weights=None, clamp_value=clamp_arg,
+            num_per_channels=128, use_ue8m0_scale=False)
         deep_gemm.fp8_gemm_nt((act_fp8, act_sf), s2_pair, y, recipe=_DENSE_RECIPE,
                               disable_ue8m0_cast=True)
 
@@ -244,17 +275,15 @@ def _bench_scenario(name: str, cfg: Dict[str, Any],
 def _scenarios(num_ranks: int) -> List[Tuple[str, Dict[str, Any]]]:
     """GLM-5.2 shape (H=6144, IH=2048, ns=1) across decode/prefill token counts.
 
-    CAVEAT: `num_experts` scales with rank count here (inherited from the
-    correctness-test scenario table, where it lets small configs run at any rank
-    count). For perf that is wrong — expert count sets tokens-per-expert
-    (tokens * topk / num_experts) and hence the GEMM M-dim efficiency, so
-    numbers from different rank counts are NOT comparable. GLM-5.2 really has
-    256 routed experts; pin it before quoting figures.
+    `num_experts` is pinned to GLM-5.2's real 256 routed experts rather than
+    scaled by rank count: expert count sets tokens-per-expert
+    (tokens * topk / num_experts) and hence GEMM M-dim efficiency, so scaling it
+    would make different rank counts incomparable.
 
     `num_tokens` is PER RANK, so t16384 on 8 ranks is 131072 tokens globally.
     """
     glm = dict(hidden=6144, intermediate_hidden=2048,
-               num_experts=8 * num_ranks, num_topk=8, num_shared_experts=1)
+               num_experts=_GLM_NUM_EXPERTS, num_topk=8, num_shared_experts=1)
     out = []
     for tokens in (128, 2048, 16384):
         out.append((f'glm5.2.t{tokens}', dict(

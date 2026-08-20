@@ -639,6 +639,16 @@ sm90_fp8_mega_moe_impl(void* y,
 #pragma unroll
             for (uint32_t i = thread_idx; i < kNumExperts; i += kNumDispatchThreads)
                 *workspace.get_expert_send_count_ptr(i) = 0;
+            // Reset the shared L1 -> L2 arrival counters for the next launch. Without
+            // this, a second back-to-back launch sees last round's terminal values:
+            // the L2 loader's spin condition is already satisfied before L1 has
+            // produced anything (or overshoots and waits forever). Single-shot
+            // correctness tests never catch it; only consecutive launches do.
+            if constexpr (kHasShared) {
+                for (uint32_t i = thread_idx; i < workspace.num_shared_l2_pool_blocks;
+                     i += kNumDispatchThreads)
+                    *workspace.get_shared_l2_full_count_ptr(i) = 0;
+            }
         } else {
             for (uint32_t i = sm_idx - 1; i < kNumExpertsPerRank; i += kNumSMs - 1) {
                 const auto num_recv_tokens = static_cast<uint32_t>(

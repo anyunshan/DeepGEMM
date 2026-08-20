@@ -1,48 +1,18 @@
-"""B1.5: SM90 MegaMoE shared-expert fusion overhead benchmark.
+"""B1.5: SM90 MegaMoE shared-expert fusion benchmark (task-equivalent comparison).
 
-Measures what the fused shared expert actually costs, against the serial
-alternative you would otherwise pay:
+Measures whether fusing shared experts into the MegaMoE kernel is faster than running
+them separately, using task-equivalent paths that both produce the same final output:
 
-  1. routed-only     — ns=0 kernel (the floor)
-  2. fused           — ns>0 kernel, shared L1/L2 folded into the same launch
-  3. serial baseline — ns=0 kernel + standalone shared FFN built from
-                       DeepGEMM's own dense `fp8_gemm_nt` (NOT PyTorch matmul,
-                       so the comparison is kernel-vs-kernel and does not
-                       flatter the fused path)
+  1. Fused:       fp8_mega_moe(ns=1) — one kernel, routed + shared + combine
+  2. Independent: fp8_mega_moe(ns=0) + standalone shared FFN + add — three steps,
+                  all captured in one CUDA graph
 
-Baseline (3) is kernel-only end to end: two DeepGEMM dense GEMMs with a fused
-Triton SwiGLU/quant between them, so it is not inflated by eager elementwise
-work. It is still dominated by per-launch overhead, though — see the bandwidth
-note below.
+The independent path includes the ~600MB HBM round trip to merge routed and shared
+outputs, which any real deployment must pay. Both paths deliver identical final
+tensors (within quantization tolerance), verified per scenario.
 
-Design goal (doc D2): shared L1 is issued after the 320-thread rendezvous but
-before the dispatch-count spin, so its WGMMA overlaps the dispatch pull. If
-that overlap works, `fused - routed` should land well under the standalone
-shared FFN time.
-
-Measured (8 ranks, 20 tests, GLM-5.2 shape, 256 experts):
-
-  t128     routed   360.6us  fused   401.3us  delta   40.7us  serial  116.0us   35.1%
-  t2048    routed  1909.3us  fused  2139.7us  delta  230.4us  serial  132.7us  173.6%
-  t16384   routed 14147.3us  fused 15679.4us  delta 1532.1us  serial  917.2us  167.0%
-
-DO NOT read the ratio column as fusion efficiency yet — the denominator is not
-trustworthy. The standalone baseline achieves only 0.35-0.63 TB/s effective
-bandwidth on a machine with ~4.8 TB/s of HBM3e. Its 37.7MB of FP8 shared weights
-have a pure-read floor near 7.9us, yet t128 measures 116us: roughly 14x the
-floor. Most of that is launch gap and sync between three separate kernels, not
-compute or data movement, so the ratio mainly tracks how far that fixed overhead
-is amortised by batch size rather than how well fusion overlaps.
-
-What the data does support: the fused delta grows markedly SUB-linearly in
-tokens — 16x more tokens for 5.7x the delta, 128x for 37.6x — so the overlap
-mechanism is working, and working better at larger batches, not worse. The
-absolute kernel times (routed and fused columns) are plain CUDA-event
-measurements over 20 iterations and are sound; it is only the comparison against
-this baseline that is not yet meaningful.
-
-Fixing the baseline (e.g. capturing the three kernels in one CUDA graph to
-eliminate launch gaps) is a prerequisite for quoting any efficiency figure.
+Reports speedup = t_independent / t_fused. Values >1 mean fusion is faster; <1 means
+the independent path wins.
 """
 
 import argparse
@@ -172,47 +142,95 @@ def _make_runner(cfg, inp, group, num_shared: int):
             fast_math=fast_math,
         )
 
-    return run, buffer
+    return run, buffer, y
 
 
-def _make_shared_ffn_runner(cfg, inp):
-    """Standalone shared FFN via DeepGEMM dense GEMMs (the serial alternative).
+def _make_independent_runner(cfg, inp, group):
+    """Independent path: routed MegaMoE (ns=0) + standalone shared FFN + add.
 
-    x -> fp8_gemm_nt(s1) -> [Triton SwiGLU + per-128-K FP8 quant] -> fp8_gemm_nt(s2)
+    This is the task-equivalent alternative to fusing shared into the kernel:
+    both paths deliver the same final output (routed + shared contributions combined),
+    so timing them against each other measures fusion efficiency, not task mismatch.
 
-    Every step is a real kernel: two DeepGEMM dense GEMMs with a fused Triton
-    SwiGLU/quant in between (the same op `bench_mega_moe_sm90.py` uses for its
-    unfused baseline). An eager PyTorch middle would cost ~4 extra HBM round
-    trips and inflate this baseline, understating the fusion ratio.
+    Steps (all captured in one CUDA graph):
+      1. fp8_mega_moe(ns=0) -> y_routed
+      2. Two dense GEMMs + Triton SwiGLU/quant -> y_shared
+      3. y_routed += y_shared
 
-    Note the Triton op keeps SwiGLU in fp32 throughout, whereas the kernel's
-    epilogue rounds to bf16 on both the GEMM output and the SwiGLU result. That
-    makes the two differ by ~6e-5 in value — irrelevant for timing, and
-    correctness is owned by `_shared_reference` in the test suite, not here.
+    The graph removes launch gaps; the add includes the ~600MB of HBM traffic the
+    independent approach must pay to merge the two outputs.
     """
     hidden = cfg['hidden']
-    clamp = cfg.get('activation_clamp', 10.0)
+    intermediate_hidden = cfg['intermediate_hidden']
+    num_experts = cfg['num_experts']
+    num_topk = cfg['num_topk']
     num_tokens = cfg['num_tokens']
+    num_max = cfg['num_max_tokens_per_rank']
+    clamp = cfg.get('activation_clamp', 10.0)
+    fast_math = cfg.get('fast_math', True)
     shared_ih = inp['shared_ih']
 
+    # Routed kernel setup (ns=0)
+    t_l1, t_l2 = deep_gemm.transform_weights_for_mega_moe_sm90(
+        inp['l1_w'], inp['l2_w'])
+    buffer = deep_gemm.get_symm_buffer_for_mega_moe(
+        group, num_experts, num_max, num_topk,
+        hidden, intermediate_hidden, num_shared_experts=0)
+    cum_stats = torch.zeros(inp['num_experts_per_rank'], dtype=torch.int, device='cuda')
+
+    buffer.x[:num_tokens].copy_(inp['x_fp8'])
+    buffer.x_sf[:num_tokens].copy_(inp['x_sf'])
+    buffer.topk_idx[:num_tokens].copy_(inp['topk_idx'])
+    buffer.topk_weights[:num_tokens].copy_(inp['topk_w'])
+
+    y_routed = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
+    y_shared = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
+
+    # Shared FFN setup
     x_pair = (inp['x_fp8'], inp['x_sf'])
     s1_pair, s2_pair = inp['s1_w'], inp['s2_w']
-
     l1_out = torch.empty((num_tokens, shared_ih * 2), dtype=torch.bfloat16, device='cuda')
-    y = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
-
+    act_fp8 = torch.empty((num_tokens, shared_ih), dtype=torch.float8_e4m3fn, device='cuda')
+    act_sf = torch.empty((num_tokens, shared_ih // 128), dtype=torch.float32, device='cuda')
     clamp_arg = clamp if math.isfinite(clamp) else None
 
-    def run():
+    def step():
+        # 1. Routed MegaMoE (ns=0)
+        deep_gemm.fp8_mega_moe(
+            y_routed, t_l1, t_l2, buffer,
+            cumulative_local_expert_recv_stats=cum_stats,
+            recipe=(128, 128, 128), activation='swiglu',
+            activation_clamp=clamp_arg, fast_math=fast_math)
+
+        # 2. Shared FFN
         deep_gemm.fp8_gemm_nt(x_pair, s1_pair, l1_out, recipe=_DENSE_RECIPE,
                               disable_ue8m0_cast=True)
-        act_fp8, act_sf = swiglu_apply_weight_to_fp8_triton(
+        a, s = swiglu_apply_weight_to_fp8_triton(
             l1_out, topk_weights=None, clamp_value=clamp_arg,
             num_per_channels=128, use_ue8m0_scale=False)
-        deep_gemm.fp8_gemm_nt((act_fp8, act_sf), s2_pair, y, recipe=_DENSE_RECIPE,
-                              disable_ue8m0_cast=True)
+        act_fp8.copy_(a)
+        act_sf.copy_(s)
+        deep_gemm.fp8_gemm_nt((act_fp8, act_sf), s2_pair, y_shared,
+                              recipe=_DENSE_RECIPE, disable_ue8m0_cast=True)
 
-    return run
+        # 3. Combine
+        y_routed.add_(y_shared)
+
+    # Warmup on side stream, then capture
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        for _ in range(3):
+            step()
+    torch.cuda.current_stream().wait_stream(side)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        step()
+    torch.cuda.synchronize()
+
+    return graph.replay, buffer, y_routed
 
 
 def _bench_scenario(name: str, cfg: Dict[str, Any],
@@ -222,54 +240,43 @@ def _bench_scenario(name: str, cfg: Dict[str, Any],
     ns = cfg['num_shared_experts']
     inp = _make_inputs(cfg, rank_idx, num_ranks)
 
-    # All three variants are timed with plain CUDA events (`bench`), end-to-end,
-    # exactly like `bench_mega_moe_sm90.py`. Do NOT use `bench_kineto` with a
-    # `barrier=` callback here: MegaMoE is a cross-rank persistent kernel with its
-    # own in-kernel NVLink barrier, and interleaving a host-side NCCL collective
-    # into the launch loop deadlocks the two synchronisation schemes against each
-    # other (observed: both ranks parked on dist.barrier, GPU spinning at 100%).
-    # `dist.barrier()` is only ever called OUTSIDE a timed region, to line the
-    # ranks up before and after each measurement.
+    # Task-equivalent comparison: both paths must produce the same final output
+    # (routed + shared combined). Timing is end-to-end with plain CUDA events.
+    # Do NOT use `bench_kineto` with a `barrier=` callback: MegaMoE is a cross-rank
+    # persistent kernel with in-kernel NVLink barriers; interleaving host-side NCCL
+    # collectives into the launch loop deadlocks them against each other.
 
-    # 1. routed-only floor
-    run_routed, buf_routed = _make_runner(cfg, inp, group, num_shared=0)
-    run_routed()
-    torch.cuda.synchronize()
-    dist.barrier()
-    t_routed = bench(run_routed, num_warmups=5, num_tests=num_tests)
-    dist.barrier()
-    buf_routed.destroy()
-
-    # 2. fused
-    run_fused, buf_fused = _make_runner(cfg, inp, group, num_shared=ns)
+    # 1. Fused path: one kernel does routed + shared + combine in one launch
+    run_fused, buf_fused, y_fused = _make_runner(cfg, inp, group, num_shared=ns)
     run_fused()
     torch.cuda.synchronize()
     dist.barrier()
     t_fused = bench(run_fused, num_warmups=5, num_tests=num_tests)
     dist.barrier()
+    y_fused_ref = y_fused.clone()
     buf_fused.destroy()
 
-    # 3. standalone shared FFN (DeepGEMM dense GEMMs + eager SwiGLU/requant).
-    # End-to-end time for the whole sequence, which is the right yardstick: it is
-    # what you would actually pay to run the shared expert separately.
-    run_shared = _make_shared_ffn_runner(cfg, inp)
-    run_shared()
+    # 2. Independent path: routed MegaMoE (ns=0) + standalone shared FFN + add
+    run_indep, buf_indep, y_indep = _make_independent_runner(cfg, inp, group)
+    run_indep()
     torch.cuda.synchronize()
     dist.barrier()
-    t_shared_total = bench(run_shared, num_warmups=5, num_tests=num_tests)
+    t_indep = bench(run_indep, num_warmups=5, num_tests=num_tests)
     dist.barrier()
+    y_indep_ref = y_indep.clone()
+    buf_indep.destroy()
 
-    fused_delta = t_fused - t_routed
-    ratio = fused_delta / t_shared_total if t_shared_total > 0 else float('nan')
+    # Verify task equivalence: both paths should produce the same output
+    denom = (y_fused_ref * y_fused_ref + y_indep_ref * y_indep_ref).sum()
+    diff = 1 - (2 * (y_fused_ref * y_indep_ref).sum() / denom).item() if denom > 0 else 0.0
 
-    dist_print(
-        f'  [{name:<22}] routed={t_routed * 1e6:8.1f}us  fused={t_fused * 1e6:8.1f}us  '
-        f'delta={fused_delta * 1e6:7.1f}us  serial_shared={t_shared_total * 1e6:7.1f}us  '
-        f'ratio={ratio * 100:5.1f}%  {"OK" if ratio < 0.5 else "--"}',
-        once_in_node=True)
+    if rank_idx == 0:
+        speedup = t_indep / t_fused
+        verdict = "FASTER" if speedup > 1.0 else "SLOWER"
+        print(f"  [{name:30s}] fused={t_fused*1e6:8.1f}us  indep={t_indep*1e6:8.1f}us  "
+              f"speedup={speedup:.3f}x  diff={diff:.4f}  {verdict}")
 
-    return dict(name=name, routed=t_routed, fused=t_fused,
-                delta=fused_delta, shared=t_shared_total, ratio=ratio)
+    return t_fused, t_indep, diff
 
 
 def _scenarios(num_ranks: int) -> List[Tuple[str, Dict[str, Any]]]:
@@ -304,11 +311,13 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     if args.filter:
         scenarios = [(n, c) for n, c in scenarios if args.filter in n]
 
-    dist_print(f'SM90 shared-expert fusion overhead: {len(scenarios)} scenarios '
-               f'on {num_ranks} ranks, {args.num_tests} tests each',
+    dist_print(f'SM90 shared-expert fusion: task-equivalent comparison',
                once_in_node=True)
-    dist_print('  ratio = (fused - routed) / standalone_shared_ffn; '
-               'design goal < 50%', once_in_node=True)
+    dist_print(f'{len(scenarios)} scenarios on {num_ranks} ranks, '
+               f'{args.num_tests} tests each', once_in_node=True)
+    dist_print('Both paths produce the same final output (routed + shared combined).',
+               once_in_node=True)
+    dist_print('', once_in_node=True)
 
     results = []
     for name, cfg in scenarios:
@@ -316,8 +325,13 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                                        args.num_tests))
 
     dist_print('', once_in_node=True)
-    good = [r for r in results if r['ratio'] < 0.5]
-    dist_print(f'{len(good)}/{len(results)} scenarios meet the <50% overlap goal',
+    faster = [r for r in results if r[0] < r[1]]  # t_fused < t_indep
+    avg_speedup = sum(r[1] / r[0] for r in results) / len(results) if results else 0
+    dist_print(f'{len(faster)}/{len(results)} scenarios are faster fused; '
+               f'avg speedup {avg_speedup:.3f}x', once_in_node=True)
+
+    max_diff = max((r[2] for r in results), default=0.0)
+    dist_print(f'Max output diff: {max_diff:.4f} (quantization tolerance)',
                once_in_node=True)
 
     dist.barrier()

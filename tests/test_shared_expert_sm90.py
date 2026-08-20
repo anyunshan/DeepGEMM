@@ -50,6 +50,9 @@ def _shared_reference(
     Mirrors the kernel: the SwiGLU output is requantized to FP8 at per-128 K
     before the L2 GEMM, so the reference must round-trip through FP8 too.
     """
+    if x_fp8.shape[0] == 0:
+        return torch.zeros((0, s2_fp8.shape[0]), dtype=torch.float32, device='cuda')
+    
     x_f32 = _dequant_per_token_per_128_k(x_fp8, x_sf)             # (M, H)
     s1_f32 = _dequant_block_128_128(s1_fp8, s1_sf)               # (2*SIH, H)
     s2_f32 = _dequant_block_128_128(s2_fp8, s2_sf)               # (H, SIH)
@@ -160,13 +163,14 @@ def _run_shared_scenario(
               f'{"OK" if ok else "FAIL"}', flush=True)
 
     # Guard against a silently-dead shared phase: with shared experts enabled the
-    # result must differ from the routed-only reference.
-    shared_mag = y_shared.abs().mean().item()
-    assert shared_mag > 1e-4, f'{name}: shared reference is ~0, test is vacuous'
-    routed_only_diff = calc_diff(y, y_routed)
-    assert routed_only_diff > 1e-3, (
-        f'{name}: output matches routed-only reference (diff={routed_only_diff:.6f}) '
-        f'— shared expert phase appears to be a no-op')
+    # result must differ from the routed-only reference, unless tokens=0.
+    if num_tokens > 0:
+        shared_mag = y_shared.abs().mean().item()
+        assert shared_mag > 1e-4, f'{name}: shared reference is ~0, test is vacuous'
+        routed_only_diff = calc_diff(y, y_routed)
+        assert routed_only_diff > 1e-3, (
+            f'{name}: output matches routed-only reference (diff={routed_only_diff:.6f}) '
+            f'— shared expert phase appears to be a no-op')
 
     assert ok, f'{name}: diff={diff} >= tol={diff_tol}'
     buffer.destroy()
@@ -181,15 +185,15 @@ def _scenarios(num_ranks: int) -> List[Tuple[str, Dict[str, Any]]]:
         hidden=512, intermediate_hidden=512,
         num_experts=8 * num_ranks, num_topk=2, num_shared_experts=1)))
     # Multiple shared experts (shared_ih = IH * ns).
-    for ns in (1, 2):
+    for ns in (1, 2, 4, 8):
         out.append((f'S2.ns{ns}.t256', dict(
             num_max_tokens_per_rank=256, num_tokens=256,
             hidden=1024, intermediate_hidden=512,
             num_experts=8 * num_ranks, num_topk=2, num_shared_experts=ns)))
-    # Token-count edges: partial tile and larger batch.
-    for tokens in (16, 260, 1024):
+    # Token-count edges: partial tile, larger batch, and zero tokens.
+    for tokens in (0, 16, 260, 1024):
         out.append((f'S3.tokens{tokens}', dict(
-            num_max_tokens_per_rank=tokens, num_tokens=tokens,
+            num_max_tokens_per_rank=max(tokens, 64), num_tokens=tokens,
             hidden=512, intermediate_hidden=512,
             num_experts=8 * num_ranks, num_topk=2, num_shared_experts=1)))
     # Activation clamp + fast_math variations.

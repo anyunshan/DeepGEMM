@@ -993,11 +993,21 @@ sm90_fp8_mega_moe_impl(void* y,
         // pull loop (the large NVLink data movement) runs concurrently with shared
         // L1 WGMMA (design doc D2). TMA loaders already pre-staged the shared L1
         // A/B tiles into smem before the fetch spin, so full_barriers are ready.
+        //
+        // Pipelined like the routed L1 path: alternate CD buffers per tile and retire
+        // each TMA store one tile late, so tile N+1 computes while tile N drains.
+        // Draining inline (tma_store_wait<0> per tile) plus a single CD buffer made
+        // this phase cost 1.5-2.7x the same GEMMs run standalone.
+        uint32_t shared_pos                = 0;
+        bool shared_l1_store_pending       = false;
+        uint32_t shared_l1_pending_m_block = 0;
         if constexpr (kHasShared) {
             for (uint32_t task = sm_idx; task < kNumSharedL1Tasks; task += kNumSMs) {
-                const uint32_t m_block_idx = task / kNumSharedL1BlockNs;
-                const uint32_t n_block_idx = task % kNumSharedL1BlockNs;
-                const uint32_t m_idx       = m_block_idx * BLOCK_M;
+                const uint32_t m_block_idx   = task / kNumSharedL1BlockNs;
+                const uint32_t n_block_idx   = task % kNumSharedL1BlockNs;
+                const uint32_t m_idx         = m_block_idx * BLOCK_M;
+                const uint32_t shared_cd_buf = shared_pos % kNumCDStages;
+                ++shared_pos;
 
                 using WGMMA                        = L1WGMMA;
                 constexpr uint32_t kAccumPerThread = WGMMA::kNumAccum;
@@ -1135,7 +1145,7 @@ sm90_fp8_mega_moe_impl(void* y,
 
                 constexpr uint32_t WG_OUT_BLOCK_N = L1WGMMA::N / 2;
                 const uint32_t wg_out_col_off     = epilogue_wg_idx * WG_OUT_BLOCK_N;
-                auto* smem_cd_l1_buf              = smem_cd_l1[0];
+                auto* smem_cd_l1_buf              = smem_cd_l1[shared_cd_buf];
 #pragma unroll
                 for (uint32_t p = 0; p < kNumPairs; ++p) {
                     auto qmul = [](float v, float ys) -> float {
@@ -1175,13 +1185,31 @@ sm90_fp8_mega_moe_impl(void* y,
                 }
                 __syncwarp();
 
-                // Drain fully before bumping the counter: unlike the routed path there is
-                // no next tile to overlap with, and the shared L2 loader's spin treats the
-                // count as "acts are readable in the symmetric buffer"
+                // Deferred retirement: publish the PREVIOUS tile's counter bump now that
+                // tma_store_wait<1> guarantees everything older than this tile's store has
+                // landed. The shared L2 loader spins on this count meaning "acts are
+                // readable in the symmetric buffer", so it must only ever be bumped after
+                // the corresponding store is visible - one tile late is safe, inline is not
+                // needed. The CD buffer alternates, so this tile's smem is not the one the
+                // pending store is still reading.
+                ptx::tma_store_wait<1>();
+                ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                if (shared_l1_store_pending and epilogue_warp_idx == 0 and cute::elect_one_sync())
+                    ptx::red_add_rel(
+                        workspace.get_shared_l2_full_count_ptr(shared_l1_pending_m_block), 1u);
+                shared_l1_store_pending   = true;
+                shared_l1_pending_m_block = m_block_idx;
+            }
+
+            // Retire the final pending store before the routed stream reuses the CD
+            // buffers and before any shared L2 task can observe a missing count
+            if (shared_l1_store_pending) {
                 ptx::tma_store_wait<0>();
                 ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
                 if (epilogue_warp_idx == 0 and cute::elect_one_sync())
-                    ptx::red_add_rel(workspace.get_shared_l2_full_count_ptr(m_block_idx), 1u);
+                    ptx::red_add_rel(
+                        workspace.get_shared_l2_full_count_ptr(shared_l1_pending_m_block), 1u);
+                shared_l1_store_pending = false;
             }
         }
 

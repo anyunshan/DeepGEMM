@@ -979,12 +979,20 @@ sm90_fp8_mega_moe_impl(void* y,
         constexpr uint32_t a_row_off    = 0;
         constexpr uint32_t sfa_row_off  = 0;
 
-        // Sync with dispatch
+        // Sync with dispatch — zero-latency release so dispatch pull starts
+        // immediately. SharedLinear1 compute runs AFTER fetch_expert_recv_count()
+        // below so that it overlaps with dispatch pull rather than serializing it.
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
 
-        // SharedLinear1 compute: AFTER the rendezvous above (so dispatch is never
-        // blocked behind shared work) and BEFORE the fetch spin — this fills the
-        // dispatch pull window with shared L1 WGMMA (design doc D2)
+        // NOTES: manually inlined scheduler loop, avoids lambda outlining that
+        // causes ptxas C7510 (serialized WGMMA pipeline)
+        scheduler.fetch_expert_recv_count();
+        scheduler.set_expert_idx(0);
+
+        // SharedLinear1 compute: AFTER fetch_expert_recv_count() so the dispatch
+        // pull loop (the large NVLink data movement) runs concurrently with shared
+        // L1 WGMMA (design doc D2). TMA loaders already pre-staged the shared L1
+        // A/B tiles into smem before the fetch spin, so full_barriers are ready.
         if constexpr (kHasShared) {
             for (uint32_t task = sm_idx; task < kNumSharedL1Tasks; task += kNumSMs) {
                 const uint32_t m_block_idx = task / kNumSharedL1BlockNs;
@@ -1177,9 +1185,6 @@ sm90_fp8_mega_moe_impl(void* y,
             }
         }
 
-        // NOTES: manually inlined scheduler loop, avoids lambda outlining that
-        // causes ptxas C7510 (serialized WGMMA pipeline)
-        scheduler.fetch_expert_recv_count();
         scheduler.set_expert_idx(0);
         uint32_t pos = 0;
         // Deferred L1-store retirement: a tile's arrival-mask bit (which tells L2 the

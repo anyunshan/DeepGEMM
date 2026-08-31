@@ -243,6 +243,39 @@ def transform_weights_for_mega_moe_sm90(
             (_interleave_weights(s1_fp8), s1_sf), shared_l2_weights)
 
 
+def mega_moe_pre_dispatch_sm90(x: torch.Tensor,
+                               topk_idx: torch.Tensor,
+                               topk_weights: torch.Tensor,
+                               buf_x: torch.Tensor,
+                               buf_x_sf: torch.Tensor,
+                               buf_topk_idx: torch.Tensor,
+                               buf_topk_weights: torch.Tensor,
+                               num_tokens: int,
+                               group_size: int = 128,
+                               routed_scaling_factor: float = 1.0) -> None:
+    """Stage BF16 activations + routing into the symmetric buffer for SM90 MegaMoE.
+
+    Quantizes ``x`` to FP8 e4m3 with per-token per-``group_size``-K float scale
+    factors, writes it (plus ``topk_idx`` / ``topk_weights``) directly into the
+    buffer views returned by ``get_symm_buffer_for_mega_moe``, and folds
+    ``routed_scaling_factor`` into the stored weights. Slots between
+    ``num_tokens`` and the buffer capacity are marked inactive
+    (``topk_idx = -1``, weight 0), which is what the fused kernel expects when a
+    batch is shorter than the allocated maximum.
+
+    Doing this in one kernel matters: the PyTorch equivalent (cast, copy x, copy
+    sf, scale+copy weights) costs four HBM round trips before the fused kernel
+    even starts.
+
+    ``topk_idx`` is int32 here (the buffer stores int64; the kernel converts).
+    """
+    _C.mega_moe_pre_dispatch_sm90(
+        x, topk_idx, topk_weights,
+        buf_x, buf_x_sf, buf_topk_idx, buf_topk_weights,
+        num_tokens, group_size, float(routed_scaling_factor),
+    )
+
+
 def fp8_mega_moe(y: torch.Tensor,
                  l1_weights: Tuple[torch.Tensor, torch.Tensor],
                  l2_weights: Tuple[torch.Tensor, torch.Tensor],

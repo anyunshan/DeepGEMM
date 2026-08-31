@@ -14,6 +14,7 @@
 #include "../jit_kernels/impls/sm100_bf16_mega_moe.hpp"
 #include "../jit_kernels/impls/sm100_fp8_fp4_mega_moe.hpp"
 #include "../jit_kernels/impls/sm90_fp8_mega_moe.hpp"
+#include "../jit_kernels/impls/sm90_mega_moe_pre_dispatch.hpp"
 
 namespace deep_gemm::mega {
 
@@ -687,6 +688,55 @@ static void fp8_mega_moe(
         sym_buffer.zero_();
 }
 
+// SM90 pre-dispatch: BF16 activations + routing -> FP8 (per-128-K float SF) laid
+// straight into the symmetric buffer, with `routed_scaling_factor` folded into
+// the topk weights. Replaces the four HBM round trips a PyTorch equivalent needs
+// (cast, copy x, copy sf, scale+copy weights) with one kernel.
+static void mega_moe_pre_dispatch_sm90(
+    const torch::Tensor& x,
+    const torch::Tensor& topk_idx,
+    const torch::Tensor& topk_weights,
+    const torch::Tensor& buf_x,
+    const torch::Tensor& buf_x_sf,
+    const torch::Tensor& buf_topk_idx,
+    const torch::Tensor& buf_topk_weights,
+    const int& num_tokens,
+    const int& group_size,
+    const float& routed_scaling_factor) {
+    const auto arch_major = device_runtime->get_arch_major();
+    DG_HOST_ASSERT(arch_major == 9);
+
+    // Inputs
+    DG_HOST_ASSERT(x.dim() == 2 and topk_idx.dim() == 2 and topk_weights.dim() == 2);
+    DG_HOST_ASSERT(x.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(topk_idx.scalar_type() == torch::kInt);
+    DG_HOST_ASSERT(topk_weights.scalar_type() == torch::kFloat32);
+    DG_HOST_ASSERT(x.is_contiguous() and topk_idx.is_contiguous() and topk_weights.is_contiguous());
+    DG_HOST_ASSERT(num_tokens >= 0 and num_tokens <= x.size(0));
+    DG_HOST_ASSERT(topk_idx.size(0) == x.size(0) and topk_weights.size(0) == x.size(0));
+    DG_HOST_ASSERT(topk_idx.size(1) == topk_weights.size(1));
+
+    // Buffer views (produced by get_symm_buffer_size_for_sm90_fp8_mega_moe)
+    DG_HOST_ASSERT(buf_x.scalar_type() == torch::kFloat8_e4m3fn);
+    DG_HOST_ASSERT(buf_x_sf.scalar_type() == torch::kFloat32);
+    DG_HOST_ASSERT(buf_topk_idx.scalar_type() == torch::kInt64);
+    DG_HOST_ASSERT(buf_topk_weights.scalar_type() == torch::kFloat32);
+    DG_HOST_ASSERT(buf_x.size(1) == x.size(1));
+    DG_HOST_ASSERT(buf_topk_idx.size(1) == topk_idx.size(1));
+    DG_HOST_ASSERT(num_tokens <= buf_topk_idx.size(0));
+    // The kernel writes rows with a plain row stride, so these views must be
+    // densely packed (the SF view in particular is K-major, not the M-major
+    // layout the routed activation SF buffers use).
+    DG_HOST_ASSERT(buf_x.is_contiguous() and buf_x_sf.is_contiguous());
+    DG_HOST_ASSERT(buf_topk_idx.is_contiguous() and buf_topk_weights.is_contiguous());
+    DG_HOST_ASSERT(x.size(1) % group_size == 0);
+    DG_HOST_ASSERT(buf_x_sf.size(1) == x.size(1) / group_size);
+
+    sm90_mega_moe_pre_dispatch(x, topk_idx, topk_weights,
+                               buf_x, buf_x_sf, buf_topk_idx, buf_topk_weights,
+                               num_tokens, group_size, routed_scaling_factor);
+}
+
 static void register_apis(pybind11::module_& m) {
 #if DG_TENSORMAP_COMPATIBLE
     m.def("get_token_alignment_for_mega_moe", &get_token_alignment_for_mega_moe);
@@ -695,6 +745,7 @@ static void register_apis(pybind11::module_& m) {
     m.def("get_symm_buffer_size_for_sm90_fp8_mega_moe", &get_symm_buffer_size_for_sm90_fp8_mega_moe);
     m.def("fp8_fp4_mega_moe", &fp8_fp4_mega_moe);
     m.def("fp8_mega_moe", &fp8_mega_moe);
+    m.def("mega_moe_pre_dispatch_sm90", &mega_moe_pre_dispatch_sm90);
     m.def("bf16_mega_moe", &bf16_mega_moe);
 #endif
 }
